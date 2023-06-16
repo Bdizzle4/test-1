@@ -1,1 +1,196 @@
 
+
+# region imports
+from AlgorithmImports import *
+# endregion
+
+import pickle
+import io
+import numpy as np
+from datetime import timedelta
+from clr import AddReference
+AddReference("System")
+AddReference("QuantConnect.Algorithm")
+AddReference("QuantConnect.Common")
+
+from System import *
+from QuantConnect import *
+from QuantConnect.Algorithm import *
+from QuantConnect.Data import *
+import joblib
+import talib as tb
+
+class MyAlgorithm(QCAlgorithm):
+    def Initialize(self):
+        
+        # download the model
+        
+        model_key = "model_1_junk"
+
+        # Check if the model exists in the ObjectStore
+        if self.ObjectStore.ContainsKey(model_key):
+            # If the model exists, load it
+            file_name = self.ObjectStore.GetFilePath(model_key)
+            self.model = joblib.load(file_name)
+        else:
+            # If the model doesn't exist, train and save it
+            # Replace "train_model()" with your actual model training code
+            self.model = self.train_model()
+            file_name = self.ObjectStore.GetFilePath(model_key)
+            joblib.dump(self.model, file_name)
+
+
+
+
+        # Set the start and end date for backtesting
+        self.SetStartDate(2020, 1, 1)
+        self.SetEndDate(2021, 1, 1)
+
+        # Define the symbol for trading
+        self.symbol = self.AddEquity("SPY").Symbol
+
+        # Set the resolution and subscribe to the data
+        self.resolution = Resolution.Daily
+        self.AddEquity("SPY", self.resolution)
+
+
+    def LoadModel(self, modelPath):
+        modelFile = self.IO.FileOpen(modelPath)
+        with modelFile.FileStream as stream:
+            model = pickle.load(stream)
+        modelFile.Dispose()
+        return model
+
+    def OnData(self, data):
+        if not self.model:
+            return
+
+        # Fetch the historical data
+        history = self.History(self.symbol, timedelta(days=180), self.resolution)
+
+        # Extract the necessary features from the historical data
+        #features = np.array([history.loc[self.symbol].close.values])
+        features = np.array([history.loc[self.symbol].values])
+
+        all_data = pd.DataFrame(history.copy())
+
+        #all_data = all_data.rename(columns={'close': 'Close', 'high':'High', 'low':'Low', 'volume':'Volume', 'time':'Time'})
+
+        #Return
+        all_data['Return'] = all_data['close'].pct_change() 
+
+        #Simple Moving Average (SMA)
+        all_data['SMA_1'] = tb.SMA(all_data['close'],15)
+        all_data['SMA_2'] = tb.SMA(all_data['close'],20)
+        all_data['SMA_3'] = tb.SMA(all_data['close'],50)
+        all_data['SMA_4'] = tb.SMA(all_data['close'],100)
+
+        #SMA Ratio short/medium/long
+        all_data['X_SMA_ratio_1_2'] = all_data['SMA_1'] / all_data['SMA_2']
+        all_data['X_SMA_ratio_2_3'] = all_data['SMA_2'] / all_data['SMA_3']
+        all_data['X_SMA_ratio_3_4'] = all_data['SMA_3'] / all_data['SMA_4']
+
+        #Average True Range (ATR)
+        all_data['X_ATR_1'] = tb.ATR(all_data['high'], all_data['low'], all_data['close'], 5)
+        all_data['X_ATR_2'] = tb.ATR(all_data['high'], all_data['low'], all_data['close'], 15)
+
+        #ATR Ratio
+        all_data['X_ATR_Ratio'] = all_data['X_ATR_1'] / all_data['X_ATR_2']
+
+        #ADX
+        all_data['X_ADX_1'] = tb.ADX(all_data['high'], all_data['low'], all_data['close'], 5)
+        all_data['X_ADX_2'] = tb.ADX(all_data['high'], all_data['low'], all_data['close'], 15)
+
+        #Stochastic Oscillators
+        all_data['Stochastic_k_1'], all_data['X_Stochastic_d_1'] = tb.STOCH(all_data['high'], all_data['low'], all_data['close'], 5, 5, 0, 5, 0)
+        all_data['Stochastic_k_2'], all_data['X_Stochastic_d_2'] = tb.STOCH(all_data['high'], all_data['low'], all_data['close'], 15, 15, 0, 15, 0)
+
+        #Stochastic Oscillators %d ratio
+        all_data['X_Stochastic_Ratio'] = all_data['X_Stochastic_d_1']/all_data['X_Stochastic_d_2']
+
+        #Relative Strength Index (RSI)
+        all_data['X_RSI_1'] = tb.RSI(all_data['close'], 5)
+        all_data['X_RSI_2'] = tb.RSI(all_data['close'], 15)
+
+        #Relative Strength Index (Ratio)
+        all_data['X_RSI_ratio'] = all_data['X_RSI_1']/all_data['X_RSI_2']
+
+        #Moving Average Convergence Divergence (MACD)
+        all_data['X_MACD'], all_data['macdsignal'], all_data['macdhist'] = tb.MACD(all_data['close'], 24, 52, 18)  #amounts for 15m data
+
+        #Rate of Change
+        all_data['X_ROC'] = tb.ROC(all_data['close'], 15)
+
+        #Aroon
+        all_data['Aroondown'], all_data['Aroonup']= tb.AROON(all_data['high'], all_data['low'], 14)
+        all_data['X_Aroon'] = all_data['Aroonup'] - all_data['Aroondown']
+
+        #Bollinger Bands
+        all_data['Upperband'], all_data['Middleband'], all_data['Lowerband'] = tb.BBANDS(all_data['close'], 15, 2, 2)
+        #BBAND ratio
+        all_data['X_BBAND_%B'] = (all_data['close'] - all_data['Lowerband']) / (all_data['Upperband'] - all_data['Lowerband'])
+
+        # Preprocess the features if required (scaling, normalization, etc.)
+
+        def get_X(data):
+            """Return model design matrix X"""
+            return data.filter(like='X').values
+
+        trade_days = 7
+        def get_y(data):
+            """Return dependent variable y"""
+            y = data.Close.pct_change(trade_days).shift(-trade_days)  # Returns after roughly two days
+            #y[y.between(-.004, .004)] = 0             # Devalue returns smaller than 0.4%
+            y[y > 0] = 1
+            y[y < 0.004] = -1                             #cleaning the dependent variable data to 1s or 0s if positive or negative after 2 days
+            return y
+
+
+        def get_clean_Xy(df):
+            """Return (X, y) cleaned of NaN values"""
+            X = get_X(df)
+            y = get_y(df).values
+            isnan = np.isnan(y)
+            X = X[~isnan]
+            y = y[~isnan]
+            return X, y
+
+        def clean_dataset(df):
+            assert isinstance(df, pd.DataFrame), "df needs to be a pd.DataFrame"
+            df.dropna(inplace=True)
+            indices_to_keep = ~df.isin([np.nan, np.inf, -np.inf]).any(1)
+            return df[indices_to_keep]
+
+
+        from sklearn.model_selection import train_test_split
+        from scipy.stats import mstats
+
+        AI_data = all_data.copy()
+        AI_data = clean_dataset(AI_data)
+
+        filtered_columns = [col for col in AI_data.columns if col.startswith('X')]
+
+        # Create a new dataframe with the filtered columns
+        filtered_data = AI_data[filtered_columns].copy()
+
+        #Winsorizing target variables
+        target_variables = filtered_data.filter(like='X').columns.tolist()
+
+        for variable in target_variables:
+            filtered_data.loc[:,variable] = mstats.winsorize(AI_data.loc[:,variable], limits = [0.05,0.05])
+
+
+        # Make predictions using the trained model
+        prediction = self.model.predict(filtered_data)
+        predictions = prediction[-1]
+
+        # Place trades based on predictions
+        if predictions > 0:
+            self.SetHoldings(self.symbol, 1)
+        elif predictions < 0:
+            self.SetHoldings(self.symbol, -1)
+        else:
+            self.Liquidate()
+
+        # Plot the predictions on the chart
+        self.Plot("Predictions", "Prediction", predictions)
