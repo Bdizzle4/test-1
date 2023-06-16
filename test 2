@@ -1,0 +1,181 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jun 15 20:04:32 2023
+
+@author: brady
+"""
+
+from clr import AddReference
+AddReference("System")
+AddReference("QuantConnect.Algorithm")
+AddReference("QuantConnect.Common")
+
+from System import *
+from QuantConnect import *
+from QuantConnect.Algorithm import *
+from QuantConnect.Data.UniverseSelection import *
+from datetime import timedelta
+import numpy as np
+import pandas as pd
+from sklearn.externals import joblib
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+
+class MyAlgorithm(QCAlgorithm):
+    def Initialize(self):
+        self.SetStartDate(2020, 1, 1)
+        self.SetEndDate(2021, 1, 1)
+        self.symbol = self.AddEquity("SPY").Symbol
+        self.resolution = Resolution.Daily
+        self.AddEquity("SPY", self.resolution)
+
+        # Fetch the historical data
+        self.data = self.History(self.symbol, timedelta(days=180), self.resolution)
+        self.all_data = pd.DataFrame(self.data.copy())
+        self.all_data = self.clean_dataset(self.all_data) # Clean the data once
+        self.features = self.extract_features(self.all_data) # Extract features once
+
+        # Load or train the model
+        model_key = "model"
+        #if self.ObjectStore.ContainsKey(model_key):
+        file_name = self.ObjectStore.GetFilePath(model_key)
+        self.model = joblib.load(file_name)
+        
+        """
+        else:
+            self.model = self.train_model()
+            file_name = self.ObjectStore.GetFilePath(model_key)
+            joblib.dump(self.model, file_name)
+            """
+
+    def OnData(self, data):
+        if not self.model:
+            return
+
+        # Update historical data and features
+        self.data = self.data.append(data[self.symbol])  # this line assumes `data` is a DataFrame
+        self.data = self.data.iloc[-180:]  # keep only the latest 180 days
+        self.all_data = pd.DataFrame(self.data.copy())  # update all_data as well
+        self.all_data = self.clean_dataset(self.all_data)  # clean the updated data
+        self.features = self.update_features(self.features, self.all_data) # Update features with the latest data
+
+        # Make predictions using the trained model
+        prediction = self.model.predict(self.features)
+        predictions = prediction[-1]
+
+        # Place trades based on predictions
+        if predictions > 0:
+            self.SetHoldings(self.symbol, 1)
+        elif predictions < 0:
+            self.SetHoldings(self.symbol, -1)
+        else:
+            self.Liquidate()
+
+        # Plot the predictions on the chart
+        self.Plot("Predictions", "Prediction", predictions)
+
+
+    def extract_features(self, data):
+        # Implement the same feature extraction logic as your current code,
+        all_data = pd.DataFrame(data.copy())
+
+        #all_data = all_data.rename(columns={'close': 'Close', 'high':'High', 'low':'Low', 'volume':'Volume', 'time':'Time'})
+
+        #Return
+        all_data['Return'] = all_data['close'].pct_change() 
+
+        #Simple Moving Average (SMA)
+        all_data['SMA_1'] = tb.SMA(all_data['close'],15)
+        all_data['SMA_2'] = tb.SMA(all_data['close'],20)
+        all_data['SMA_3'] = tb.SMA(all_data['close'],50)
+        all_data['SMA_4'] = tb.SMA(all_data['close'],100)
+
+        #SMA Ratio short/medium/long
+        all_data['X_SMA_ratio_1_2'] = all_data['SMA_1'] / all_data['SMA_2']
+        all_data['X_SMA_ratio_2_3'] = all_data['SMA_2'] / all_data['SMA_3']
+        all_data['X_SMA_ratio_3_4'] = all_data['SMA_3'] / all_data['SMA_4']
+
+        #Average True Range (ATR)
+        all_data['X_ATR_1'] = tb.ATR(all_data['high'], all_data['low'], all_data['close'], 5)
+        all_data['X_ATR_2'] = tb.ATR(all_data['high'], all_data['low'], all_data['close'], 15)
+
+        #ATR Ratio
+        all_data['X_ATR_Ratio'] = all_data['X_ATR_1'] / all_data['X_ATR_2']
+
+        #ADX
+        all_data['X_ADX_1'] = tb.ADX(all_data['high'], all_data['low'], all_data['close'], 5)
+        all_data['X_ADX_2'] = tb.ADX(all_data['high'], all_data['low'], all_data['close'], 15)
+
+        #Stochastic Oscillators
+        all_data['Stochastic_k_1'], all_data['X_Stochastic_d_1'] = tb.STOCH(all_data['high'], all_data['low'], all_data['close'], 5, 5, 0, 5, 0)
+        all_data['Stochastic_k_2'], all_data['X_Stochastic_d_2'] = tb.STOCH(all_data['high'], all_data['low'], all_data['close'], 15, 15, 0, 15, 0)
+
+        #Stochastic Oscillators %d ratio
+        all_data['X_Stochastic_Ratio'] = all_data['X_Stochastic_d_1']/all_data['X_Stochastic_d_2']
+
+        #Relative Strength Index (RSI)
+        all_data['X_RSI_1'] = tb.RSI(all_data['close'], 5)
+        all_data['X_RSI_2'] = tb.RSI(all_data['close'], 15)
+
+        #Relative Strength Index (Ratio)
+        all_data['X_RSI_ratio'] = all_data['X_RSI_1']/all_data['X_RSI_2']
+
+        #Moving Average Convergence Divergence (MACD)
+        all_data['X_MACD'], all_data['macdsignal'], all_data['macdhist'] = tb.MACD(all_data['close'], 24, 52, 18)  #amounts for 15m data
+
+        #Rate of Change
+        all_data['X_ROC'] = tb.ROC(all_data['close'], 15)
+
+        #Aroon
+        all_data['Aroondown'], all_data['Aroonup']= tb.AROON(all_data['high'], all_data['low'], 14)
+        all_data['X_Aroon'] = all_data['Aroonup'] - all_data['Aroondown']
+
+        #Bollinger Bands
+        all_data['Upperband'], all_data['Middleband'], all_data['Lowerband'] = tb.BBANDS(all_data['close'], 15, 2, 2)
+        #BBAND ratio
+        all_data['X_BBAND_%B'] = (all_data['close'] - all_data['Lowerband']) / (all_data['Upperband'] - all_data['Lowerband'])
+
+        # but return a DataFrame of features (X) instead of modifying `all_data` in-place.
+        # ... (feature extraction code) ...
+        return(get_X(all_data))
+    
+    
+    def get_X(data):
+        """Return model design matrix X"""
+        return data.filter(like='X').values
+    """
+    def update_features(self, old_features, new_data):
+        # Update `old_features` with the features extracted from the latest data point in `new_data`.
+        # ... (feature extraction code for the last data point) ...
+        pass
+    """
+    
+    
+    def update_features(self, old_features, new_data):
+        # Combine the two dataframes
+        #combined_data = pd.concat([old_features, new_data])
+    
+        # Get the latest data point
+        latest_data_point = new_data.iloc[-1]
+    
+        # Feature extraction code for the last data point
+        # Replace this with your actual feature extraction code
+        extracted_features = extract_features(latest_data_point)
+    
+        # Update the old features with the extracted features
+        updated_features = old_features.append(extracted_features, ignore_index=True)
+    
+        # Return the updated features dataframe
+        return updated_features
+    
+    
+    def clean_dataset(self, df):
+        assert isinstance(df, pd.DataFrame), "df needs to be a pd.DataFrame"
+        df.dropna(inplace=True)
+        indices_to_keep = ~df.isin([np.nan, np.inf, -np.inf]).any(1)
+        return df[indices_to_keep]
+
+    def train_model(self):
+        prediction = self.model.predict()
+        predictions = prediction[-1]
+        pass
