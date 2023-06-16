@@ -1,0 +1,179 @@
+
+ 
+
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import RidgeClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.decomposition import PCA
+from AlgorithmImports import *
+
+class MachineLearningAlgo(QCAlgorithm):
+    
+    def Initialize(self):
+        
+        self.SetStartDate(2020, 5, 2)  
+        self.SetEndDate(2023, 7, 2)  
+        self.SetCash(1000000)  
+        self.AddEquity("SPY", Resolution.Daily)  
+        self.SetBenchmark("SPY")
+        self.SetBrokerageModel(BrokerageName.AlphaStreams)
+        self.SetExecution(ImmediateExecutionModel())
+        self.SetPortfolioConstruction(EqualWeightingPortfolioConstructionModel())
+        
+        self.ticker = self.AddCrypto("BTCUSD", Resolution.Daily).Symbol
+        
+        self.AddUniverseSelection(ManualUniverseSelectionModel(self.ticker))
+        
+        self.SetWarmup(30)
+
+        self.AddAlpha(MachineLearningAlphaModel(self,self.ticker))
+                        
+class MachineLearningAlphaModel(AlphaModel):
+                        
+    def __init__(self, algo, symbol):
+        self.algo = algo
+        self.ticker = symbol
+        self.dataBySymbol = {}
+        self.dataBySymbol[self.ticker] = SymbolData(self.algo,symbol)
+        self.period = 30
+            
+    def GetMLModel(self):
+        self.MLModel = 0
+        # self.MLModel = RidgeClassifier(random_state=18)   
+        self.MLModel = MLPClassifier(hidden_layer_sizes = (100, 100, 100), max_iter = 1000)
+        
+    def Update(self, algorithm, data):
+        insights = []
+        
+        if data.Bars.ContainsKey(self.ticker) and not algorithm.IsWarmingUp and self.dataBySymbol[ self.ticker ].IsReady():
+            self.dataBySymbol[ self.ticker ].Update(data)
+            
+            if self.dataBySymbol[ self.ticker ].Close_rolling.IsReady \
+                and self.dataBySymbol[ self.ticker ].Volume_rolling.IsReady \
+                and self.dataBySymbol[ self.ticker ].RSI_rolling.IsReady \
+                and self.dataBySymbol[ self.ticker ].Trend_rolling.IsReady \
+                and self.dataBySymbol[ self.ticker ].AD_rolling.IsReady\
+                and self.dataBySymbol[ self.ticker ].STOK_rolling.IsReady \
+                and self.dataBySymbol[ self.ticker ].STOD_rolling.IsReady \
+                and self.dataBySymbol[ self.ticker ].KAMA_rolling.IsReady:
+                
+                df1 = pd.DataFrame(self.dataBySymbol[ self.ticker ].Close_rolling, columns=["Close"]).reset_index(drop=True)
+                df2 = pd.DataFrame(self.dataBySymbol[ self.ticker ].Volume_rolling, columns=["Volume"]).reset_index(drop=True)
+                df3 = pd.DataFrame(self.dataBySymbol[ self.ticker ].RSI_rolling, columns=["RSI"]).reset_index(drop=True)
+                df4 = pd.DataFrame(self.dataBySymbol[ self.ticker ].Trend_rolling, columns=["Trend"]).reset_index(drop=True)
+                df5 = pd.DataFrame(self.dataBySymbol[ self.ticker ].AD_rolling, columns=["AD"]).reset_index(drop=True)
+                df6 = pd.DataFrame(self.dataBySymbol[ self.ticker ].STOK_rolling, columns=["STOK"]).reset_index(drop=True)
+                df7 = pd.DataFrame(self.dataBySymbol[ self.ticker ].STOD_rolling, columns=["STOD"]).reset_index(drop=True)
+                df8 = pd.DataFrame(self.dataBySymbol[ self.ticker ].KAMA_rolling, columns=["KAMA"]).reset_index(drop=True)
+                
+                self.df = pd.concat([df1, df2, df3, df4, df5, df6, df7, df8], axis=1)
+                
+                # calculate daily forward returns to be used to set Target / Signal
+                self.df['Return'] = np.log(self.df["Close"].shift(-1)/self.df["Close"]) 
+                self.df = self.df.dropna()
+                
+                # set Signal / Target
+                self.df["Signal"] = 0
+                self.df.loc[self.df["Return"] > 0, "Signal"] = 1
+                self.df.loc[self.df["Return"] < 0, "Signal"] = -1
+                
+                # set training data
+                self.X = self.df.drop(["Close", "Return", "Signal"], axis=1)
+                self.Y = self.df['Signal']
+                
+                # align feature set & signal 
+                self.Y, self.X = self.Y.align(self.X, axis=0, join='inner')
+                
+                self.X_train = self.X[:-1]
+                self.Y_train = self.Y[:-1]
+                self.X_train.replace([np.inf, -np.inf], np.nan, inplace=True)
+                self.Y_train.replace([np.inf, -np.inf], np.nan, inplace=True)
+                
+                drops = []
+                [drops.append(i) for i in range(self.X_train.shape[0]) if self.X_train.iloc[i].isnull().any()]
+                [drops.append(i) for i in range(self.Y_train.shape[0]) if self.Y_train.iloc[i] == np.nan and i not in drops]
+                self.X_train.drop(index=self.X_train.index[drops], inplace=True)
+                self.Y_train.drop(index=self.Y_train.index[drops], inplace=True)
+                if self.X_train.empty or self.Y_train.empty: return []
+                
+                # fit / train ML model
+                self.GetMLModel()
+                self.MLModel.fit(self.X_train, self.Y_train)
+                
+                # predict next day signal using today's values of feature set
+                self.X_today = self.X.iloc[-1]
+                # self.X_today is Series, so convert to numpy array
+                self.X_today = self.X_today.to_numpy()
+                # reshape self.X_today because it only has 1 day's sample
+                self.X_today = self.X_today.reshape(1,-1)
+                
+                # Y_predict will take predicted signal
+                self.Y_predict = self.Y.iloc[-1]
+                try:
+                    self.Y_predict = self.MLModel.predict(self.X_today)
+                except: return []
+                
+                # set insight based on predicted signal
+                if self.Y_predict == 1:
+                    insights.append(Insight(self.ticker, timedelta(days=30), InsightType.Price, InsightDirection.Up))
+                elif self.Y_predict == -1:
+                    insights.append(Insight(self.ticker, timedelta(days=30), InsightType.Price, InsightDirection.Down))
+                else:
+                    insights.append(Insight(self.ticker, timedelta(days=30), InsightType.Price, InsightDirection.Flat))
+                    
+        return insights
+    
+    def OnSecuritiesChanged(self, algorithm, changes):
+        self.changes = changes 
+        
+class SymbolData:
+    def __init__(self, algo, symbol):
+        self.lookback = 30
+        self.algo = algo
+        self.ticker = symbol
+        self.Close_rolling = RollingWindow[float](self.lookback)
+        
+        self.Volume_rolling = RollingWindow[float](self.lookback)
+        self.fast_volume_LWMA_indicator = self.algo.LWMA(self.ticker, 5, Resolution.Daily, Field.Volume)
+        self.slow_volume_LWMA_indicator = self.algo.LWMA(self.ticker, 20, Resolution.Daily, Field.Volume)
+        
+        self.RSI_rolling = RollingWindow[float](self.lookback)
+        self.RSI_indicator = self.algo.RSI(self.ticker, 25, Resolution.Daily)
+        
+        self.Trend_rolling = RollingWindow[float](self.lookback)
+        self.trLWMA_indicator = self.algo.LWMA(self.ticker, 15, Resolution.Daily)
+        self.ROC_indicator =  IndicatorExtensions.Of(RateOfChange(1), self.trLWMA_indicator)
+        
+        self.AD_rolling = RollingWindow[float](self.lookback)
+        self.AD_indicator = self.algo.AD(self.ticker, Resolution.Daily)
+        
+        self.STOK_rolling = RollingWindow[float](self.lookback)
+        self.STOD_rolling = RollingWindow[float](self.lookback)
+        self.STO_indicator =  self.algo.STO(self.ticker, 14, 14, 3, Resolution.Daily)
+        
+        self.KAMA_rolling = RollingWindow[float](self.lookback)
+        self.KAMA_indicator = self.algo.KAMA(self.ticker, 25, Resolution.Daily)
+        
+    def Update(self,data):
+            self.Close_rolling.Add(data[self.ticker].Close)
+            
+            self.Volume_rolling.Add(self.fast_volume_LWMA_indicator.Current.Value / self.slow_volume_LWMA_indicator.Current.Value)
+            
+            self.RSI_rolling.Add(self.RSI_indicator.Current.Value)
+            
+            self.Trend_rolling.Add(self.ROC_indicator.Current.Value)
+            
+            self.AD_rolling.Add(self.AD_indicator.Current.Value)
+            
+            self.STOK_rolling.Add(self.STO_indicator.StochK.Current.Value)
+            self.STOD_rolling.Add(self.STO_indicator.StochD.Current.Value)
+            
+            self.KAMA_rolling.Add(self.KAMA_indicator.Current.Value)
+            
+    def IsReady(self):
+        return self.RSI_indicator.IsReady \
+                    and self.fast_volume_LWMA_indicator.IsReady and self.slow_volume_LWMA_indicator.IsReady \
+                    and self.trLWMA_indicator.IsReady and self.AD_indicator.IsReady \
+                    and self.STO_indicator.IsReady and self.KAMA_indicator.IsReady
+        
